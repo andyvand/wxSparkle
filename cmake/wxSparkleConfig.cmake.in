@@ -1,0 +1,21 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# dependencies of the static library
+if(NOT @BUILD_SHARED_LIBS@)
+    find_dependency(Threads)
+    find_dependency(CURL)
+    find_dependency(EXPAT)
+    if(@WXSPARKLE_HAVE_OPENSSL@)
+        find_dependency(OpenSSL)
+    endif()
+    if(NOT TARGET wxSparkle::wxsparkle_wx)
+        # wxWidgets was found using its CMake package
+        find_dependency(wxWidgets CONFIG)
+    endif()
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/wxSparkleTargets.cmake")
+
+check_required_components(wxSparkle)
