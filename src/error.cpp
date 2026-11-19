@@ -8,9 +8,13 @@
 
 #include "error.h"
 
+#include "platform.h"
+
 #include <string>
 #include <cstdio>
-#include <mutex>
+#if !WXSPARKLE_CLASSIC_MAC
+    #include <mutex>
+#endif
 
 #ifdef _WIN32
     #include <windows.h>
@@ -81,6 +85,11 @@ void LogError(const char *msg)
 
 #ifdef _WIN32
     OutputDebugStringA(err.c_str());
+#elif WXSPARKLE_CLASSIC_MAC
+    // There's no std::mutex, but no lock is needed either: threads are
+    // cooperative and stdio calls don't yield to other threads.
+    fputs(err.c_str(), stderr);
+    fflush(stderr);
 #else
     static std::mutex s_logMutex;
     std::lock_guard<std::mutex> lock(s_logMutex);

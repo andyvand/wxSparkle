@@ -25,13 +25,48 @@ if(APPLE)
     enable_language(OBJCXX)
 endif()
 
+# Classic Mac OS (System 7 - Mac OS 9) with the Retro68 toolchain: 68k
+# (retro68.toolchain.cmake) or PowerPC (retroppc.toolchain.cmake).
+set(WXSPARKLE_RETRO68 OFF)
+if(CMAKE_SYSTEM_NAME MATCHES "^Retro(68|PPC)$")
+    set(WXSPARKLE_RETRO68 ON)
+
+    # The sysroot, e.g. /opt/retro68/m68k-apple-macos
+    list(GET CMAKE_SYSTEM_PREFIX_PATH 0 WXSPARKLE_RETRO68_SYSROOT)
+    get_filename_component(WXSPARKLE_RETRO68_SYSROOT "${WXSPARKLE_RETRO68_SYSROOT}" ABSOLUTE)
+
+    # Retro68's toolchain files don't confine find_*() to the sysroot, so the
+    # host's packages (e.g. libcurl or wx-config in /usr/local) would be found
+    # instead of the sysroot's ones. Host programs (msgfmt) are fine.
+    list(APPEND CMAKE_FIND_ROOT_PATH "${WXSPARKLE_RETRO68_SYSROOT}")
+    set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+    set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+    set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+    set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+    # same for pkg-config, which would look into the host's directories too
+    if(NOT DEFINED ENV{PKG_CONFIG_LIBDIR})
+        set(ENV{PKG_CONFIG_LIBDIR} "${WXSPARKLE_RETRO68_SYSROOT}/lib/pkgconfig:${WXSPARKLE_RETRO68_SYSROOT}/share/pkgconfig")
+    endif()
+
+    # keep the (statically linked) applications small
+    add_compile_options(-ffunction-sections -fdata-sections)
+
+    message(STATUS "wxSparkle: building for classic Mac OS (${CMAKE_SYSTEM_NAME}, ${WXSPARKLE_RETRO68_SYSROOT})")
+endif()
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+if(WXSPARKLE_RETRO68)
+    # newlib only declares POSIX functions used by wxWidgets' headers (strdup,
+    # strnlen, ...) in the GNU mode
+    set(CMAKE_CXX_EXTENSIONS ON)
+else()
+    set(CMAKE_CXX_EXTENSIONS OFF)
+endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 #---------------------------------------------------------------------------
@@ -43,9 +78,17 @@ option(WXSPARKLE_USE_WEBVIEW "Show release notes using wxWebView (if available)"
 option(WXSPARKLE_WITH_DSA "Support legacy DSA signatures (requires OpenSSL)" ON)
 option(WXSPARKLE_TRUST_NATIVE_CA "Trust the OS certificate store in addition to the embedded CA bundle" OFF)
 option(WXSPARKLE_TRANSLATIONS "Embed translations (requires gettext's msgfmt)" ON)
+# winsparkle-tool is a command line program to run on the developer's machine
+# and the unit tests need a POSIX file system, so neither is built for
+# classic Mac OS by default.
+if(WXSPARKLE_RETRO68)
+    set(_wxsparkle_host_tools_default OFF)
+else()
+    set(_wxsparkle_host_tools_default ON)
+endif()
 option(WXSPARKLE_BUILD_EXAMPLE "Build the example wxWidgets application" ON)
-option(WXSPARKLE_BUILD_TOOL "Build winsparkle-tool (EdDSA key generation and signing)" ON)
-option(WXSPARKLE_BUILD_TESTS "Build unit tests" ON)
+option(WXSPARKLE_BUILD_TOOL "Build winsparkle-tool (EdDSA key generation and signing)" ${_wxsparkle_host_tools_default})
+option(WXSPARKLE_BUILD_TESTS "Build unit tests" ${_wxsparkle_host_tools_default})
 
 set(WXSPARKLE_CA_BUNDLE "${CMAKE_CURRENT_SOURCE_DIR}/cert.pem" CACHE FILEPATH
     "PEM file with the CA certificates embedded into the library")
@@ -59,7 +102,29 @@ set(WXSPARKLE_CA_BUNDLE "${CMAKE_CURRENT_SOURCE_DIR}/cert.pem" CACHE FILEPATH
 set(_wx_libs)
 set(WXSPARKLE_HAVE_WEBVIEW OFF)
 
-find_package(wxWidgets 3.2 CONFIG QUIET COMPONENTS core base)
+if(WXSPARKLE_RETRO68)
+    # wxRetro68's CMake package refers to its dependencies' targets (JPEG::JPEG,
+    # ZSTD::ZSTD, WebP::webp, ...) without looking for them, so it can't be
+    # used: use the sysroot's wx-config (never the host's one).
+    set(wxWidgets_CONFIG_EXECUTABLE "${WXSPARKLE_RETRO68_SYSROOT}/bin/wx-config"
+        CACHE FILEPATH "wx-config of wxWidgets for Retro68")
+    if(NOT EXISTS "${wxWidgets_CONFIG_EXECUTABLE}")
+        message(FATAL_ERROR "wxWidgets for Retro68 (wxRetro68) not found: "
+                            "${wxWidgets_CONFIG_EXECUTABLE} doesn't exist")
+    endif()
+else()
+    find_package(wxWidgets 3.2 CONFIG QUIET COMPONENTS core base)
+    if(NOT wxWidgets_FOUND)
+        # wxWidgets' package version file only accepts requests for the same
+        # major.minor version (so that 3.3 doesn't satisfy "3.2"); look for
+        # any version and check it here instead.
+        find_package(wxWidgets CONFIG QUIET COMPONENTS core base)
+        if(wxWidgets_FOUND AND wxWidgets_VERSION VERSION_LESS 3.2)
+            message(STATUS "wxSparkle: ignoring wxWidgets ${wxWidgets_VERSION} CMake package (3.2 or newer is required)")
+            set(wxWidgets_FOUND FALSE)
+        endif()
+    endif()
+endif()
 if(wxWidgets_FOUND AND TARGET wx::core)
     set(_wx_libs wx::core wx::base)
     if(TARGET wx::html)
@@ -69,9 +134,11 @@ if(wxWidgets_FOUND AND TARGET wx::core)
         list(PREPEND _wx_libs wx::webview)
         set(WXSPARKLE_HAVE_WEBVIEW ON)
     endif()
-    message(STATUS "wxSparkle: using wxWidgets CMake package")
+    set(WXSPARKLE_WX_CMAKE_PACKAGE ON)
+    message(STATUS "wxSparkle: using wxWidgets ${wxWidgets_VERSION} CMake package")
 else()
-    if(WXSPARKLE_USE_WEBVIEW)
+    # (wxRetro68 has no wxWebView, but its wx-config doesn't complain about it)
+    if(WXSPARKLE_USE_WEBVIEW AND NOT WXSPARKLE_RETRO68)
         find_package(wxWidgets 3.2 QUIET COMPONENTS webview html core base)
         if(wxWidgets_FOUND)
             set(WXSPARKLE_HAVE_WEBVIEW ON)
@@ -96,6 +163,7 @@ else()
     endif()
     target_link_libraries(wxsparkle_wx INTERFACE ${wxWidgets_LIBRARIES})
     set(_wx_libs wxsparkle_wx)
+    set(WXSPARKLE_WX_CMAKE_PACKAGE OFF)
     message(STATUS "wxSparkle: using FindwxWidgets (${wxWidgets_VERSION_STRING})")
 endif()
 message(STATUS "wxSparkle: wxWebView release notes: ${WXSPARKLE_HAVE_WEBVIEW}")
@@ -122,7 +190,22 @@ if(_curl_aliased)
 endif()
 get_target_property(_curl_type ${_curl_real_target} TYPE)
 option(WXSPARKLE_CURL_PKGCONFIG_STATIC "Use pkg-config to find static libcurl's dependencies" ON)
-if(_curl_type STREQUAL "STATIC_LIBRARY" AND WXSPARKLE_CURL_PKGCONFIG_STATIC AND NOT MSVC)
+if(WXSPARKLE_RETRO68)
+    # Retro68's libcurl comes without pkg-config or CMake files. It uses
+    # OpenSSL for TLS, zlib for content decoding and MacTCP (libmactcp, which
+    # provides BSD sockets) for networking.
+    find_package(OpenSSL REQUIRED)
+    find_package(ZLIB REQUIRED)
+    find_library(WXSPARKLE_MACTCP_LIBRARY NAMES mactcp)
+    # (its BSD sockets headers are in <include>/mactcp)
+    find_path(WXSPARKLE_MACTCP_INCLUDE_PARENT NAMES mactcp/sys/socket.h)
+    if(NOT WXSPARKLE_MACTCP_LIBRARY OR NOT WXSPARKLE_MACTCP_INCLUDE_PARENT)
+        message(FATAL_ERROR "libmactcp (needed by Retro68's libcurl) not found")
+    endif()
+    set(WXSPARKLE_MACTCP_INCLUDE_DIR "${WXSPARKLE_MACTCP_INCLUDE_PARENT}/mactcp")
+    target_link_libraries(wxsparkle_curl INTERFACE
+        OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB "${WXSPARKLE_MACTCP_LIBRARY}")
+elseif(_curl_type STREQUAL "STATIC_LIBRARY" AND WXSPARKLE_CURL_PKGCONFIG_STATIC AND NOT MSVC)
     find_package(PkgConfig QUIET)
     if(PKG_CONFIG_FOUND)
         pkg_check_modules(WXSPARKLE_CURL_PC QUIET libcurl)
@@ -276,7 +359,10 @@ add_library(wxsparkle_ed25519 OBJECT
     3rdparty/ed25519/src/sign.c
     3rdparty/ed25519/src/verify.c)
 target_include_directories(wxsparkle_ed25519 PUBLIC 3rdparty/ed25519/src)
-set_target_properties(wxsparkle_ed25519 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# (classic Mac OS code is relocated by the loader, -fPIC isn't supported)
+if(NOT WXSPARKLE_RETRO68)
+    set_target_properties(wxsparkle_ed25519 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
 if(MSVC)
     target_compile_options(wxsparkle_ed25519 PRIVATE /wd4244 /wd4146)
 endif()
@@ -301,6 +387,7 @@ set(WXSPARKLE_SOURCES
     src/appcontroller.h
     src/download.h
     src/error.h
+    src/platform.h
     src/settings.h
     src/signatureverifier.h
     src/threads.h
@@ -322,6 +409,9 @@ else()
 endif()
 if(APPLE)
     list(APPEND WXSPARKLE_SOURCES src/platform_mac.mm)
+endif()
+if(WXSPARKLE_RETRO68)
+    list(APPEND WXSPARKLE_SOURCES src/platform_classicmac.cpp)
 endif()
 
 set(WXSPARKLE_PUBLIC_HEADERS
@@ -374,7 +464,7 @@ set_target_properties(wxsparkle PROPERTIES
     OBJCXX_VISIBILITY_PRESET hidden
     C_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
-    POSITION_INDEPENDENT_CODE ON
+    POSITION_INDEPENDENT_CODE $<NOT:$<BOOL:${WXSPARKLE_RETRO68}>>
     PUBLIC_HEADER "${WXSPARKLE_PUBLIC_HEADERS}")
 
 target_link_libraries(wxsparkle
@@ -385,6 +475,14 @@ target_link_libraries(wxsparkle
 
 if(WXSPARKLE_HAVE_OPENSSL)
     target_link_libraries(wxsparkle PRIVATE OpenSSL::Crypto)
+endif()
+
+if(WXSPARKLE_RETRO68)
+    # mactcp.h, for letting other threads run while waiting for the network
+    target_include_directories(wxsparkle PRIVATE "${WXSPARKLE_MACTCP_INCLUDE_DIR}")
+    if(BUILD_SHARED_LIBS)
+        message(FATAL_ERROR "wxSparkle can only be built as a static library for classic Mac OS")
+    endif()
 endif()
 
 find_package(Threads REQUIRED)
@@ -423,7 +521,40 @@ if(WXSPARKLE_BUILD_TOOL)
     endif()
 endif()
 
-if(WXSPARKLE_BUILD_EXAMPLE)
+if(WXSPARKLE_BUILD_EXAMPLE AND WXSPARKLE_RETRO68)
+    # A classic Mac OS application: wxsparkle-example.bin (MacBinary),
+    # wxsparkle-example.dsk (HFS disk image) and wxsparkle-example.APPL.
+    # (add_application() comes from Retro68's toolchain file.)
+    #
+    # Memory partition sizes in MB, see example.r.in
+    if(CMAKE_SYSTEM_NAME STREQUAL "RetroPPC")
+        set(WXSPARKLE_EXAMPLE_PREFERRED_SIZE 32)
+        set(WXSPARKLE_EXAMPLE_MINIMUM_SIZE 26)
+    else()
+        set(WXSPARKLE_EXAMPLE_PREFERRED_SIZE 24)
+        set(WXSPARKLE_EXAMPLE_MINIMUM_SIZE 18)
+    endif()
+    configure_file(examples/wx/retro68/example.r.in
+                   "${CMAKE_CURRENT_BINARY_DIR}/wxsparkle-example.r" @ONLY)
+    add_application(wxsparkle-example
+        examples/wx/example.cpp
+        "${CMAKE_CURRENT_BINARY_DIR}/wxsparkle-example.r"
+        CREATOR WXSP)
+    target_link_libraries(wxsparkle-example PRIVATE wxsparkle ${_wx_libs})
+    target_link_options(wxsparkle-example PRIVATE -Wl,--gc-sections)
+
+    # Replace the disk image written by Rez, which is too small for the
+    # application (see cmake/retro68_dsk.cmake)
+    add_custom_command(TARGET wxsparkle-example_APPL POST_BUILD
+        COMMAND "${CMAKE_COMMAND}"
+                "-DBIN=${CMAKE_CURRENT_BINARY_DIR}/wxsparkle-example.bin"
+                "-DDSK=${CMAKE_CURRENT_BINARY_DIR}/wxsparkle-example.dsk"
+                -DNAME=wxsparkle-example
+                "-DHFSUTILS=${RETRO68_ROOT}/bin"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/retro68_dsk.cmake"
+        COMMENT "Creating wxsparkle-example.dsk"
+        VERBATIM)
+elseif(WXSPARKLE_BUILD_EXAMPLE)
     add_executable(wxsparkle-example WIN32 MACOSX_BUNDLE examples/wx/example.cpp)
     target_link_libraries(wxsparkle-example PRIVATE wxsparkle ${_wx_libs})
     set_target_properties(wxsparkle-example PROPERTIES
@@ -462,6 +593,10 @@ endif()
 # Installation
 #---------------------------------------------------------------------------
 
+if(WXSPARKLE_RETRO68 AND NOT DEFINED CMAKE_INSTALL_LIBDIR)
+    # (GNUInstallDirs can't determine it, as the pointer size isn't known)
+    set(CMAKE_INSTALL_LIBDIR lib)
+endif()
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 

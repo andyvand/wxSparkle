@@ -18,8 +18,13 @@
 #include <vector>
 #include <string.h>
 
+#include "platform.h"
+
 #ifdef _WIN32
     #include <windows.h>
+#endif
+#if WXSPARKLE_CLASSIC_MAC
+    #include <wx/string.h>
 #endif
 
 namespace winsparkle
@@ -177,6 +182,13 @@ inline std::filesystem::path PathFromWide(const std::wstring& s)
 {
 #ifdef _WIN32
     return std::filesystem::path(s);
+#elif WXSPARKLE_CLASSIC_MAC
+    // HFS path in the file system encoding (e.g. Mac Roman), as understood
+    // by the C library
+    const wxCharBuffer buf = wxString(s).fn_str();
+    if ( !buf.data() )
+        throw std::runtime_error("Invalid file name");
+    return std::filesystem::path(std::string(buf.data()));
 #else
     return std::filesystem::path(ToUtf8(s));
 #endif
@@ -186,6 +198,8 @@ inline std::wstring PathToWide(const std::filesystem::path& p)
 {
 #ifdef _WIN32
     return p.wstring();
+#elif WXSPARKLE_CLASSIC_MAC
+    return wxString(p.native().c_str(), *wxConvFileName).ToStdWstring();
 #else
     return FromUtf8(p.string());
 #endif

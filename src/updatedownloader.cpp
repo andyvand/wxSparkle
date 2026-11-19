@@ -13,7 +13,14 @@
 #include "ui.h"
 #include "error.h"
 #include "signatureverifier.h"
+#include "platform.h"
 #include "utils.h"
+
+#if WXSPARKLE_CLASSIC_MAC
+    #include <wx/filefn.h>
+    #include <wx/filename.h>
+    #include <wx/stdpaths.h>
+#endif
 
 #include <chrono>
 #include <cstdio>
@@ -31,6 +38,94 @@ namespace winsparkle
 
 namespace
 {
+
+#if WXSPARKLE_CLASSIC_MAC
+
+// Classic Mac OS: HFS paths and wxWidgets file functions are used, as the
+// POSIX file system API isn't available.
+typedef wxString UpdatePath;
+
+// (HFS names are limited to 31 characters, 17 + 2*6 are used)
+const char TEMP_DIR_PREFIX[] = "wxSparkle Update ";
+const size_t TEMP_DIR_RANDOM_BYTES = 6;
+
+wxString GetTempDirectory()
+{
+    wxString tmp = wxStandardPaths::Get().GetTempDir();
+    if ( tmp.empty() )
+        throw std::runtime_error("Cannot create temporary directory: cannot determine temp dir");
+    // (a volume's root, "Volume:", keeps its separator)
+    if ( tmp.Last() == ':' && tmp.find(':') != tmp.length() - 1 )
+        tmp.RemoveLast();
+    return tmp;
+}
+
+// There's no OS source of randomness (std::random_device would throw), but
+// the names don't need to be unpredictable on this single user OS, only
+// unique.
+std::string RandomHexString(size_t bytes)
+{
+    static unsigned s_counter = 0;
+    std::seed_seq seed{
+        unsigned(std::chrono::steady_clock::now().time_since_epoch().count()),
+        unsigned(std::chrono::system_clock::now().time_since_epoch().count()),
+        ++s_counter };
+    std::mt19937 gen(seed);
+
+    static const char hex[] = "0123456789abcdef";
+    std::string s;
+    for ( size_t i = 0; i < bytes; i++ )
+    {
+        const unsigned v = gen() & 0xFF;
+        s += hex[v >> 4];
+        s += hex[v & 0xF];
+    }
+    return s;
+}
+
+wxString CreateUniqueTempDirectory()
+{
+    const wxString tmpdir = GetTempDirectory();
+
+    for ( int attempt = 0; attempt < 100; attempt++ )
+    {
+        const wxString name = wxString(TEMP_DIR_PREFIX) + RandomHexString(TEMP_DIR_RANDOM_BYTES);
+        const wxString dir = wxFileName(tmpdir, name).GetFullPath();
+
+        if ( wxFileName::DirExists(dir) || wxFileName::FileExists(dir) )
+            continue; // already exists, try another name
+
+        if ( !wxFileName::Mkdir(dir) )
+            throw std::runtime_error("Cannot create temporary directory");
+        return dir;
+    }
+
+    throw std::runtime_error("Cannot create temporary directory");
+}
+
+// Checks that the directory actually is a valid update temp dir, to prevent
+// malicious users from forcing us into deleting arbitrary directories.
+bool IsValidUpdateTempDir(const wxString& dir)
+{
+    // "::" is HFS's equivalent of "/../"
+    if ( dir.empty() || dir.Contains("::") || dir[0] == ':' )
+        return false;
+
+    const wxFileName fn(dir);
+    // (HFS names are case-insensitive)
+    if ( !fn.GetPath().IsSameAs(GetTempDirectory(), false) )
+        return false;
+
+    const wxString name = fn.GetFullName();
+    const wxString prefix(TEMP_DIR_PREFIX);
+    return name.length() > prefix.length() && name.StartsWith(prefix);
+}
+
+#else // !WXSPARKLE_CLASSIC_MAC
+
+typedef fs::path UpdatePath;
+
+const size_t TEMP_DIR_RANDOM_BYTES = 16;
 
 // Name prefix of the temporary directories. On Windows, the same prefix as in
 // WinSparkle is used, so that leftovers from older versions are cleaned up.
@@ -85,7 +180,7 @@ fs::path CreateUniqueTempDirectory()
     {
         fs::path dir = tmpdir;
         fs::path::string_type name(TEMP_DIR_PREFIX);
-        const std::string rnd = RandomHexString(16);
+        const std::string rnd = RandomHexString(TEMP_DIR_RANDOM_BYTES);
         name += fs::path(rnd).native();
         dir /= name;
 
@@ -128,10 +223,12 @@ bool IsValidUpdateTempDir(const fs::path& dir)
     return name.size() > prefix.size() && name.compare(0, prefix.size(), prefix) == 0;
 }
 
+#endif // WXSPARKLE_CLASSIC_MAC/!WXSPARKLE_CLASSIC_MAC
+
 
 struct UpdateDownloadSink : public IDownloadSink
 {
-    UpdateDownloadSink(Thread& thread, const fs::path& dir)
+    UpdateDownloadSink(Thread& thread, const UpdatePath& dir)
         : m_thread(thread),
           m_downloaded(0), m_total(0),
           m_file(NULL),
@@ -155,7 +252,11 @@ struct UpdateDownloadSink : public IDownloadSink
         }
     }
 
+#if WXSPARKLE_CLASSIC_MAC
+    std::wstring GetFilePath(void) { return m_path.ToStdWstring(); }
+#else
     std::wstring GetFilePath(void) { return PathToWide(m_path); }
+#endif
 
     virtual void SetLength(size_t l) { m_total = l; }
 
@@ -164,13 +265,46 @@ struct UpdateDownloadSink : public IDownloadSink
         if ( m_file )
             throw std::runtime_error("Update file already set");
 
+#if WXSPARKLE_CLASSIC_MAC
+        // DownloadFile() already sanitized the name, but be defensive; HFS
+        // names are also limited to 31 characters (keep the extension):
+        wxFileName fn(m_dir, wxString(detail::SanitizeFileName(filename)));
+        wxString name = fn.GetName();
+        const wxString ext = fn.GetExt();
+        const size_t maxName = 31 - (ext.empty() ? 0 : ext.length() + 1);
+        if ( ext.length() > 10 || maxName < 1 )
+        {
+            // not really an extension
+            name = fn.GetFullName();
+            if ( name.length() > 31 )
+                name.Truncate(31);
+            fn.SetFullName(name);
+        }
+        else if ( name.length() > maxName )
+        {
+            name.Truncate(maxName);
+            fn.SetName(name);
+        }
+        m_path = fn.GetFullPath();
+
+        if ( wxFileName::Exists(m_path) )
+            throw std::runtime_error("Cannot save update file");
+        // (the C library understands HFS paths in the file system encoding)
+        const wxCharBuffer fsPath = m_path.fn_str();
+        m_file = fsPath.data() ? fopen(fsPath.data(), "wb") : NULL;
+#else
         // DownloadFile() already sanitized the name, but be defensive:
         m_path = m_dir / PathFromWide(detail::SanitizeFileName(filename));
 #ifdef _WIN32
+#if __STDC_WANT_SECURE_LIB__
+        _wfopen_s(&m_file, m_path.c_str(), L"wb");
+#else
         m_file = _wfopen(m_path.c_str(), L"wb");
+#endif
 #else
         m_file = fopen(m_path.c_str(), "wbx"); // fail if it exists
 #endif
+#endif // WXSPARKLE_CLASSIC_MAC/!WXSPARKLE_CLASSIC_MAC
         if ( !m_file )
             throw std::runtime_error("Cannot save update file");
     }
@@ -200,8 +334,8 @@ struct UpdateDownloadSink : public IDownloadSink
     Thread& m_thread;
     size_t m_downloaded, m_total;
     FILE *m_file;
-    fs::path m_dir;
-    fs::path m_path;
+    UpdatePath m_dir;
+    UpdatePath m_path;
     std::chrono::steady_clock::time_point m_lastUpdate;
 };
 
@@ -230,8 +364,12 @@ void UpdateDownloader::Run()
 
     try
     {
-      const fs::path tmpdir = CreateUniqueTempDirectory();
+      const UpdatePath tmpdir = CreateUniqueTempDirectory();
+#if WXSPARKLE_CLASSIC_MAC
+      Settings::WriteConfigValue("UpdateTempDir", tmpdir.ToStdWstring());
+#else
       Settings::WriteConfigValue("UpdateTempDir", PathToWide(tmpdir));
+#endif
 
       UpdateDownloadSink sink(*this, tmpdir);
       DownloadFile(m_appcast.enclosure.DownloadURL, &sink, this, Settings::GetHttpHeadersString());
@@ -285,7 +423,11 @@ void UpdateDownloader::CleanLeftovers()
     if ( !Settings::ReadConfigValue("UpdateTempDir", tmpdirStr) )
         return;
 
+#if WXSPARKLE_CLASSIC_MAC
+    const wxString tmpdir(tmpdirStr);
+#else
     const fs::path tmpdir = PathFromWide(tmpdirStr);
+#endif
 
     // Check that the directory actually is a valid update temp dir, to prevent
     // malicious users from forcing us into deleting arbitrary directories:
@@ -302,6 +444,12 @@ void UpdateDownloader::CleanLeftovers()
         return;
     }
 
+#if WXSPARKLE_CLASSIC_MAC
+    // (aliases inside it are files, removing them doesn't affect the target)
+    const bool ok = !wxFileName::DirExists(tmpdir) ||
+                    wxFileName::Rmdir(tmpdir, wxPATH_RMDIR_RECURSIVE);
+    if ( ok )
+#else
     std::error_code ec;
     if ( fs::is_symlink(tmpdir, ec) )
         fs::remove(tmpdir, ec); // remove the link only, never its target
@@ -309,6 +457,7 @@ void UpdateDownloader::CleanLeftovers()
         fs::remove_all(tmpdir, ec);
 
     if ( !ec )
+#endif
     {
         Settings::DeleteConfigValue("UpdateTempDir");
     }

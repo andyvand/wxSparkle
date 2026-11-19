@@ -10,6 +10,7 @@
 #define _threads_h_
 
 #include "error.h"
+#include "platform.h"
 
 #include <atomic>
 #include <memory>
@@ -17,9 +18,16 @@
 
 // Native Win32 primitives are used on Windows (as in WinSparkle), so that
 // toolchains whose C++ library lacks std::thread (e.g. some MinGW builds)
-// are supported too; standard C++ primitives are used elsewhere.
+// are supported too. Classic Mac OS's C++ library has no std::thread either,
+// so POSIX threads (pthreads-retro68, on top of the Thread Manager) are used
+// for the synchronization objects there, while the threads themselves are
+// wxThreads, see Thread::Start(). Standard C++ primitives are used elsewhere.
 #ifdef _WIN32
     #include <windows.h>
+#elif WXSPARKLE_CLASSIC_MAC
+    #define WXSPARKLE_PTHREADS 1
+    #include <pthread.h>
+    class wxThread;
 #else
     #include <condition_variable>
     #include <mutex>
@@ -55,6 +63,11 @@ public:
 private:
 #ifdef _WIN32
     HANDLE m_handle;
+#elif defined(WXSPARKLE_PTHREADS)
+    pthread_mutex_t m_mutex;
+    pthread_cond_t m_cond;
+    bool m_signaled;
+    bool m_manualReset;
 #else
     std::mutex m_mutex;
     std::condition_variable m_cond;
@@ -77,6 +90,12 @@ public:
 
     void Enter() { EnterCriticalSection(&m_cs); }
     void Leave() { LeaveCriticalSection(&m_cs); }
+#elif defined(WXSPARKLE_PTHREADS)
+    CriticalSection();
+    ~CriticalSection() { pthread_mutex_destroy(&m_cs); }
+
+    void Enter() { pthread_mutex_lock(&m_cs); }
+    void Leave() { pthread_mutex_unlock(&m_cs); }
 #else
     CriticalSection() {}
 
@@ -90,6 +109,8 @@ public:
 private:
 #ifdef _WIN32
     CRITICAL_SECTION m_cs;
+#elif defined(WXSPARKLE_PTHREADS)
+    pthread_mutex_t m_cs;
 #else
     std::recursive_mutex m_cs;
 #endif
@@ -203,6 +224,9 @@ private:
     static void ThreadEntryPoint(Thread *thread);
 #ifdef _WIN32
     static unsigned __stdcall Win32ThreadEntryPoint(void *data);
+#elif defined(WXSPARKLE_PTHREADS)
+    static void *PosixThreadEntryPoint(void *data);
+    friend class ThreadRunner;
 #endif
 
     // returns true if called from this thread
@@ -221,6 +245,8 @@ private:
 #ifdef _WIN32
     HANDLE                 m_handle;
     unsigned               m_id;
+#elif defined(WXSPARKLE_PTHREADS)
+    wxThread              *m_thread;    // joinable threads only
 #else
     std::thread            m_thread;
 #endif

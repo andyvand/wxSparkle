@@ -9,6 +9,7 @@
 #include "ui.h"
 #include "settings.h"
 #include "error.h"
+#include "platform.h"
 #include "updatechecker.h"
 #include "updatedownloader.h"
 #include "appcontroller.h"
@@ -677,7 +678,18 @@ struct WebBrowserState
 };
 
 
-#ifndef __WXMSW__
+#if WXSPARKLE_CLASSIC_MAC
+// Launches the downloaded update file on classic Mac OS: there are no
+// executable installers that could be downloaded (an application needs its
+// resource fork), so it's an archive or a disk image, opened by the Finder.
+bool LaunchUpdateFile(const std::wstring& file, const std::string& arguments)
+{
+    if ( !arguments.empty() )
+        LogWarning("Installer arguments are ignored on classic Mac OS.");
+
+    return ClassicMacOpenFile(wxString(file));
+}
+#elif !defined(__WXMSW__)
 // Launches the downloaded update file on non-Windows platforms:
 // - executables (no extension, .AppImage, .run, .sh, .bin) are executed with
 //   the installer arguments
@@ -1287,6 +1299,11 @@ bool UpdateDialog::RunInstaller()
 void UpdateDialog::SetMessage(const wxString& text, int width)
 {
     m_message->SetLabel(text);
+    // Wrap() does nothing if called with the same width as the last time,
+    // even though the label changed: reset it first, so that the new label
+    // is wrapped too. (This matters for ports that only show the label as
+    // given, e.g. wxUniversal used on classic Mac OS.)
+    m_message->Wrap(-1);
     m_message->Wrap(PX(width));
 
     // Wrapping at requested width may fail, e.g. for languages that don't use

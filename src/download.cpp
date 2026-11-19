@@ -19,6 +19,16 @@
 
 #include <curl/curl.h>
 
+#if WXSPARKLE_CLASSIC_MAC
+    #include <pthread.h>
+    #include <sys/socket.h> // libmactcp's, for mactcp_set_idle_func()
+    // (Retro68's libcurl always uses OpenSSL)
+    #include <openssl/err.h>
+    #include <openssl/pem.h>
+    #include <openssl/ssl.h>
+    #include <openssl/x509.h>
+#endif
+
 #include <algorithm>
 #include <cctype>
 #include <exception>
@@ -44,6 +54,8 @@ namespace
     #define UA_OS "Windows"
 #elif defined(__APPLE__)
     #define UA_OS "macOS"
+#elif WXSPARKLE_CLASSIC_MAC
+    #define UA_OS "Mac OS"
 #elif defined(__linux__)
     #define UA_OS "Linux"
 #elif defined(__FreeBSD__)
@@ -64,6 +76,10 @@ namespace
     #define UA_ARCH "riscv"
 #elif defined(__powerpc64__)
     #define UA_ARCH "ppc64"
+#elif defined(__powerpc__) || defined(__ppc__)
+    #define UA_ARCH "ppc"
+#elif defined(__m68k__)
+    #define UA_ARCH "m68k"
 #else
     #define UA_ARCH "unknown"
 #endif
@@ -94,11 +110,126 @@ std::string MakeUserAgent()
 CriticalSection g_curlInitCS;
 bool g_curlInitialized = false;
 
+#if WXSPARKLE_CLASSIC_MAC
+
+// Threads are cooperative on classic Mac OS: while a transfer waits for the
+// network, other threads -- in particular the main one running the UI --
+// only get to run if the waiting thread yields. libmactcp calls an idle
+// function while waiting, which does this; it also cancels the wait if the
+// thread doing the transfer is asked to terminate.
+
+pthread_key_t g_transferThreadKey;      // Thread* doing a transfer
+mactcp_idle_func g_prevMacTcpIdle = NULL;
+
+int MacTcpIdle()
+{
+    // the default one calls SystemTask(); chain to it
+    int rc = g_prevMacTcpIdle ? g_prevMacTcpIdle() : 0;
+
+    sched_yield();
+
+    Thread *thread = static_cast<Thread*>(pthread_getspecific(g_transferThreadKey));
+    if ( thread && thread->IsTerminationRequested() )
+        rc = 1; // cancel the wait
+
+    return rc;
+}
+
+// Associates the transfer with the current (OS) thread for MacTcpIdle().
+class TransferThreadSetter
+{
+public:
+    explicit TransferThreadSetter(Thread *thread)
+    {
+        pthread_setspecific(g_transferThreadKey, thread);
+    }
+
+    ~TransferThreadSetter()
+    {
+        pthread_setspecific(g_transferThreadKey, NULL);
+    }
+
+    TransferThreadSetter(const TransferThreadSetter&) = delete;
+    TransferThreadSetter& operator=(const TransferThreadSetter&) = delete;
+};
+
+// Parsing the embedded CA bundle (~150 certificates) is very slow on classic
+// Macs: it takes many seconds even on fast ones. libcurl would do it for
+// every transfer, after connecting but before starting the TLS handshake,
+// so servers drop the idle connection in the meantime (and, threads being
+// cooperative, nothing else could run while it's parsed). Instead, parse it
+// once, before connecting and yielding to other threads after every
+// certificate, and give the resulting store to libcurl's SSL_CTX.
+
+CriticalSection g_caStoreCS;
+X509_STORE *g_caStore = NULL;
+
+X509_STORE *GetCAStore(Thread *thread)
+{
+    CriticalSectionLocker lock(g_caStoreCS);
+    if ( g_caStore )
+        return g_caStore;
+
+    X509_STORE *store = X509_STORE_new();
+    BIO *bio = BIO_new_mem_buf(wxsparkle_cacert_pem, int(wxsparkle_cacert_pem_size));
+    if ( !store || !bio )
+    {
+        X509_STORE_free(store);
+        BIO_free(bio);
+        throw std::runtime_error("Out of memory");
+    }
+
+    int count = 0;
+    bool cancelled = false;
+    while ( X509 *cert = PEM_read_bio_X509(bio, NULL, NULL, NULL) )
+    {
+        if ( X509_STORE_add_cert(store, cert) )
+            count++;
+        X509_free(cert);
+
+        sched_yield();
+        if ( thread && thread->IsTerminationRequested() )
+        {
+            cancelled = true;
+            break;
+        }
+    }
+    ERR_clear_error(); // (end of data is reported as an error)
+    BIO_free(bio);
+
+    if ( cancelled || count == 0 )
+    {
+        X509_STORE_free(store);
+        if ( cancelled )
+            throw Thread::TerminateThreadException();
+        throw std::runtime_error("Failed to load the CA certificates");
+    }
+
+    g_caStore = store; // kept for the lifetime of the process
+    return store;
+}
+
+CURLcode SetCAStoreCallback(CURL *, void *sslctx, void *store)
+{
+    // (takes a reference to the store)
+    SSL_CTX_set1_cert_store(static_cast<SSL_CTX*>(sslctx), static_cast<X509_STORE*>(store));
+    return CURLE_OK;
+}
+
+#endif // WXSPARKLE_CLASSIC_MAC
+
 void EnsureCurlInitialized()
 {
     CriticalSectionLocker lock(g_curlInitCS);
     if ( g_curlInitialized )
         return;
+
+#if WXSPARKLE_CLASSIC_MAC
+    const int err = pthread_key_create(&g_transferThreadKey, NULL);
+    if ( err )
+        throw std::runtime_error(std::string("Failed to initialize networking: ") + strerror(err));
+    g_prevMacTcpIdle = mactcp_set_idle_func(&MacTcpIdle);
+#endif
 
     const CURLcode rc = curl_global_init(CURL_GLOBAL_DEFAULT);
     if ( rc != CURLE_OK )
@@ -289,7 +420,7 @@ extern "C" size_t CurlWriteCallback(char *ptr, size_t size, size_t nmemb, void *
 }
 
 
-extern "C" int CurlProgressCallback(void *clientp, curl_off_t, curl_off_t, curl_off_t, curl_off_t)
+extern "C" int CurlProgressCallback(void *clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t, curl_off_t)
 {
     TransferContext& ctx = *static_cast<TransferContext*>(clientp);
 
@@ -481,6 +612,10 @@ void DownloadFile(const std::string& url, IDownloadSink* sink, Thread* onThread,
 {
     EnsureCurlInitialized();
 
+#if WXSPARKLE_CLASSIC_MAC
+    TransferThreadSetter transferThread(onThread);
+#endif
+
     std::unique_ptr<CURL, CurlEasyDeleter> curl(curl_easy_init());
     if ( !curl )
         throw std::runtime_error("Failed to create libcurl handle");
@@ -563,11 +698,19 @@ void DownloadFile(const std::string& url, IDownloadSink* sink, Thread* onThread,
     // TLS: verify against the CA certificates embedded from cert.pem
     SET_CURL_OPT(c, CURLOPT_SSL_VERIFYPEER, 1L);
     SET_CURL_OPT(c, CURLOPT_SSL_VERIFYHOST, 2L);
+#if WXSPARKLE_CLASSIC_MAC
+    // (see GetCAStore(); only needed for HTTPS, but redirects may lead there)
+    SET_CURL_OPT(c, CURLOPT_SSL_CTX_FUNCTION, &SetCAStoreCallback);
+    SET_CURL_OPT(c, CURLOPT_SSL_CTX_DATA, GetCAStore(onThread));
+    // don't use any CA file configured into libcurl
+    curl_easy_setopt(c, CURLOPT_CAINFO, static_cast<char*>(nullptr));
+#else
     curl_blob caBlob;
     caBlob.data = const_cast<unsigned char*>(wxsparkle_cacert_pem);
     caBlob.len = wxsparkle_cacert_pem_size;
     caBlob.flags = CURL_BLOB_NOCOPY;
     SET_CURL_OPT(c, CURLOPT_CAINFO_BLOB, &caBlob);
+#endif
     // don't use any CA directory configured into libcurl
     curl_easy_setopt(c, CURLOPT_CAPATH, static_cast<char*>(nullptr));
 #if defined(WXSPARKLE_TRUST_NATIVE_CA) && defined(CURLSSLOPT_NATIVE_CA)

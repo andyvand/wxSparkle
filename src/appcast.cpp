@@ -9,6 +9,8 @@
 #include "appcast.h"
 #include "error.h"
 
+#include "platform.h"
+
 #include <expat.h>
 #include <algorithm>
 #include <cstdio>
@@ -37,6 +39,9 @@ namespace
     #define OS_MARKER_GENERIC "windows"
 #elif defined(__APPLE__)
     #define OS_MARKER_GENERIC "macos"
+#elif WXSPARKLE_CLASSIC_MAC
+    // (not "macos", whose binaries can't run on classic Mac OS)
+    #define OS_MARKER_GENERIC "macos-classic"
 #elif defined(__linux__)
     #define OS_MARKER_GENERIC "linux"
 #elif defined(__FreeBSD__)
@@ -55,6 +60,10 @@ namespace
     #define OS_MARKER_ARCH_SUFFIX "-arm"
 #elif defined(__riscv) && (__riscv_xlen == 64)
     #define OS_MARKER_ARCH_SUFFIX "-riscv64"
+#elif defined(__m68k__)
+    #define OS_MARKER_ARCH_SUFFIX "-m68k"
+#elif (defined(__powerpc__) || defined(__ppc__)) && !defined(__powerpc64__)
+    #define OS_MARKER_ARCH_SUFFIX "-ppc"
 #else
     #define OS_MARKER_ARCH_SUFFIX "-unknown"
 #endif
@@ -114,9 +123,10 @@ bool is_compatible_with_os_version(const Appcast& item)
     return VerifyVersionInfoW(&osvi, dwTypeMask, dwlConditionMask) != FALSE;
 }
 
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) || WXSPARKLE_CLASSIC_MAC
 
 // sparkle:minimumSystemVersion is the macOS version, e.g. "10.15" or "13.0.1"
+// (or the classic Mac OS one, e.g. "7.6.1" or "9.2")
 bool is_compatible_with_os_version(const Appcast& item)
 {
     auto& version = item.MinOSVersion;
@@ -164,9 +174,20 @@ bool is_compatible_with_os_version(const Appcast&)
 // - empty string    on any OS
 // and similarly "macos", "macos-arm64", "macos-x64" on macOS or "linux",
 // "linux-x64", "linux-arm64" etc. on Linux.
+//
+// PowerPC Macs run 68k code too (emulated), so "macos-classic-m68k" items are
+// compatible with them, but native ones are preferred.
+#if WXSPARKLE_CLASSIC_MAC && !defined(__m68k__)
+    #define OS_MARKER_ARCH_FALLBACK OS_MARKER_GENERIC "-m68k"
+#endif
+
 inline bool is_compatible_with_os_arch(const Appcast::Enclosure& enclosure)
 {
-    return enclosure.OS.empty() || enclosure.OS == OS_MARKER_GENERIC || enclosure.OS == OS_MARKER_ARCH;
+    return enclosure.OS.empty() || enclosure.OS == OS_MARKER_GENERIC || enclosure.OS == OS_MARKER_ARCH
+#ifdef OS_MARKER_ARCH_FALLBACK
+           || enclosure.OS == OS_MARKER_ARCH_FALLBACK
+#endif
+           ;
 }
 
 
@@ -190,6 +211,14 @@ Appcast::Enclosure find_best_enclosure_for_os_arch(const std::vector<Appcast::En
                       [](const Appcast::Enclosure& e) { return e.OS == OS_MARKER_GENERIC; });
     if (it != compatible.end())
         return *it;
+
+#ifdef OS_MARKER_ARCH_FALLBACK
+    // is there one for an architecture this one can emulate?
+    it = std::find_if(compatible.begin(), compatible.end(),
+                      [](const Appcast::Enclosure& e) { return e.OS == OS_MARKER_ARCH_FALLBACK; });
+    if (it != compatible.end())
+        return *it;
+#endif
 
     // because all enclosures are compatible, any one will do, e.g. the first one:
     return compatible.front();

@@ -14,31 +14,43 @@
 //    Info.plist keys on macOS (SUFeedURL, SUPublicEDKey, SUPublicDSAKey[File]).
 //  - Runtime configuration is stored in an INI-style file instead of the
 //    registry; see win_sparkle_set_registry_path() in winsparkle.h.
+//
+//  On classic Mac OS (Retro68), the INI file lives in the Preferences folder
+//  and is accessed using wxWidgets, which knows how to handle HFS paths; the
+//  POSIX file system API isn't available there.
 
 #ifndef _WIN32
 
 #include "settings.h"
 
 #include "error.h"
+#include "platform.h"
 #include "utils.h"
 
 #include <wx/app.h>
+#if WXSPARKLE_CLASSIC_MAC
+    #include <wx/filefn.h>
+    #include <wx/filename.h>
+    #include <wx/stdpaths.h>
+#endif
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
-#include <strings.h>
 #include <fstream>
 #include <map>
 #include <sstream>
 #include <vector>
 
-#include <pwd.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#if !WXSPARKLE_CLASSIC_MAC
+    #include <pwd.h>
+    #include <sys/stat.h>
+    #include <unistd.h>
+#endif
 
 #ifdef __APPLE__
     #include <CoreFoundation/CoreFoundation.h>
@@ -49,12 +61,32 @@ namespace fs = std::filesystem;
 namespace winsparkle
 {
 
+#if WXSPARKLE_CLASSIC_MAC
+    typedef wxString ConfigPath; // full HFS path
+#else
+    typedef fs::path ConfigPath;
+#endif
+
 /*--------------------------------------------------------------------------*
                                  helpers
  *--------------------------------------------------------------------------*/
 
 namespace
 {
+
+// ASCII case-insensitive comparison (strcasecmp() isn't available everywhere)
+bool EqualsNoCase(const std::string& a, const char *b)
+{
+    const size_t len = strlen(b);
+    if ( a.size() != len )
+        return false;
+    for ( size_t i = 0; i < len; i++ )
+    {
+        if ( tolower(static_cast<unsigned char>(a[i])) != tolower(static_cast<unsigned char>(b[i])) )
+            return false;
+    }
+    return true;
+}
 
 #ifdef __APPLE__
 
@@ -125,6 +157,73 @@ std::string ReadBundleResource(const std::string& name)
 #endif // __APPLE__
 
 
+#if WXSPARKLE_CLASSIC_MAC
+
+// HFS file and folder names are limited to 31 characters and can't contain
+// colons, the path separator.
+wxString MakeHFSName(const std::string& utf8)
+{
+    wxString name = wxString::FromUTF8(utf8);
+    name.Replace(":", "-");
+    if ( name.length() > 31 )
+        name.Truncate(31);
+    return name;
+}
+
+// Maps the registry-style path to a file in the Preferences folder, e.g.
+// "Software\Company\App\WinSparkle" -> "<Preferences>:Company:App:WinSparkle.ini"
+ConfigPath GetConfigFile(bool global)
+{
+    // there's no separate system-wide configuration
+    if ( global )
+        return ConfigPath();
+
+    const std::string regpath = Settings::GetRegistryPath();
+
+    // a full HFS path ("Volume:Folder:File") is used as-is
+    if ( regpath.find(':') != std::string::npos && regpath[0] != ':' )
+        return wxString::FromUTF8(regpath);
+
+    std::vector<std::string> components;
+    std::string p = regpath;
+    for ( auto& c : p )
+    {
+        if ( c == '\\' || c == '/' )
+            c = '\n';
+    }
+    std::istringstream ss(p);
+    std::string component;
+    while ( std::getline(ss, component, '\n') )
+    {
+        if ( component.empty() || component == "." || component == ".." )
+            continue;
+        if ( components.empty() && EqualsNoCase(component, "Software") )
+            continue;
+        components.push_back(component);
+    }
+
+    if ( components.empty() )
+        throw std::runtime_error("Invalid settings path \"" + regpath + "\"");
+
+    const wxString prefs = wxStandardPaths::Get().GetUserConfigDir();
+    if ( prefs.empty() )
+        throw std::runtime_error("Cannot determine the Preferences folder");
+
+    wxFileName fn(prefs, wxString());
+    for ( size_t i = 0; i + 1 < components.size(); i++ )
+        fn.AppendDir(MakeHFSName(components[i]));
+
+    // (keep room for the extension)
+    wxString name = MakeHFSName(components.back());
+    if ( name.length() > 27 )
+        name.Truncate(27);
+    fn.SetFullName(name + ".ini");
+
+    return fn.GetFullPath();
+}
+
+#else // !WXSPARKLE_CLASSIC_MAC
+
 std::string GetHomeDir()
 {
     const char *home = getenv("HOME");
@@ -181,7 +280,7 @@ fs::path RegistryPathToRelativeFile(const std::string& regpath)
         if ( first )
         {
             first = false;
-            if ( strcasecmp(component.c_str(), "Software") == 0 )
+            if ( EqualsNoCase(component, "Software") )
                 continue;
         }
         rel /= component;
@@ -207,6 +306,8 @@ fs::path GetConfigFile(bool global)
     const fs::path rel = RegistryPathToRelativeFile(regpath);
     return (global ? GetSystemConfigBaseDir() : GetUserConfigBaseDir()) / rel;
 }
+
+#endif // WXSPARKLE_CLASSIC_MAC/!WXSPARKLE_CLASSIC_MAC
 
 
 std::string EscapeValue(const std::string& s)
@@ -251,11 +352,16 @@ std::string UnescapeValue(const std::string& s)
 typedef std::vector<std::pair<std::string, std::string>> IniEntries;
 
 // Loads "key=value" lines; comments ('#', ';') and [sections] are ignored.
-bool LoadIniFile(const fs::path& file, IniEntries& entries)
+bool LoadIniFile(const ConfigPath& file, IniEntries& entries)
 {
     entries.clear();
 
+#if WXSPARKLE_CLASSIC_MAC
+    // (the C library understands HFS paths in the file system encoding)
+    std::ifstream f(static_cast<const char*>(file.fn_str()), std::ios::binary);
+#else
     std::ifstream f(file, std::ios::binary);
+#endif
     if ( !f )
         return false;
 
@@ -274,7 +380,50 @@ bool LoadIniFile(const fs::path& file, IniEntries& entries)
     return true;
 }
 
-void SaveIniFile(const fs::path& file, const IniEntries& entries)
+#if WXSPARKLE_CLASSIC_MAC
+
+void SaveIniFile(const ConfigPath& file, const IniEntries& entries)
+{
+    const wxFileName fn(file);
+    const wxString dir = fn.GetPath();
+    if ( !wxFileName::DirExists(dir) &&
+         !wxFileName::Mkdir(dir, wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL) )
+    {
+        throw std::runtime_error("Cannot write settings: cannot create folder " + std::string(dir.utf8_str()));
+    }
+
+    // write to a temporary file first and replace the old one with it (it
+    // must be in the same folder, for the rename to work)
+    const wxString tmp = wxFileName(dir, "wxSparkle settings.tmp").GetFullPath();
+
+    {
+        std::ofstream f(static_cast<const char*>(tmp.fn_str()), std::ios::binary | std::ios::trunc);
+        if ( !f )
+            throw std::runtime_error("Cannot write settings to " + std::string(tmp.utf8_str()));
+
+        f << "# WinSparkle (wxSparkle) settings\n";
+        for ( const auto& e : entries )
+            f << e.first << '=' << EscapeValue(e.second) << '\n';
+
+        f.flush();
+        if ( !f )
+        {
+            f.close();
+            wxRemoveFile(tmp);
+            throw std::runtime_error("Cannot write settings to " + std::string(tmp.utf8_str()));
+        }
+    }
+
+    if ( !wxRenameFile(tmp, file, true) )
+    {
+        wxRemoveFile(tmp);
+        throw std::runtime_error("Cannot write settings to " + std::string(file.utf8_str()));
+    }
+}
+
+#else // !WXSPARKLE_CLASSIC_MAC
+
+void SaveIniFile(const ConfigPath& file, const IniEntries& entries)
 {
     std::error_code ec;
     fs::create_directories(file.parent_path(), ec);
@@ -310,6 +459,8 @@ void SaveIniFile(const fs::path& file, const IniEntries& entries)
         throw std::runtime_error("Cannot write settings to " + file.string());
     }
 }
+
+#endif // WXSPARKLE_CLASSIC_MAC/!WXSPARKLE_CLASSIC_MAC
 
 } // anonymous namespace
 
@@ -419,7 +570,7 @@ int WIN_SPARKLE_CALL Settings::DefaultConfigRead(const char *name, wchar_t *buf,
     // system-wide file too (equivalent of HKLM on Windows).
     for ( bool global : { false, true } )
     {
-        const fs::path file = GetConfigFile(global);
+        const ConfigPath file = GetConfigFile(global);
         if ( file.empty() )
             continue;
 
@@ -445,7 +596,7 @@ int WIN_SPARKLE_CALL Settings::DefaultConfigRead(const char *name, wchar_t *buf,
 
 void WIN_SPARKLE_CALL Settings::DefaultConfigWrite(const char *name, const wchar_t *value, void *)
 {
-    const fs::path file = GetConfigFile(false);
+    const ConfigPath file = GetConfigFile(false);
 
     IniEntries entries;
     LoadIniFile(file, entries);
@@ -467,7 +618,7 @@ void WIN_SPARKLE_CALL Settings::DefaultConfigWrite(const char *name, const wchar
 
 void WIN_SPARKLE_CALL Settings::DefaultConfigDelete(const char *name, void *)
 {
-    const fs::path file = GetConfigFile(false);
+    const ConfigPath file = GetConfigFile(false);
 
     IniEntries entries;
     if ( !LoadIniFile(file, entries) )

@@ -12,6 +12,12 @@
 #if defined(_WIN32)
     #include <windows.h>
     #include <process.h>
+#elif defined(WXSPARKLE_PTHREADS)
+    #include <wx/thread.h>
+    #include <cerrno>
+    #include <cstring>
+    #include <ctime>
+    #include <stdexcept>
 #else
     #include <chrono>
     #include <pthread.h>
@@ -44,6 +50,8 @@ void SetCurrentThreadName(const std::string& name)
     }
 #elif defined(__APPLE__)
     pthread_setname_np(name.c_str());
+#elif defined(WXSPARKLE_PTHREADS)
+    pthread_setname_np(pthread_self(), name.c_str());
 #elif defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
     // Linux limits thread names to 15 characters + NUL
     pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());
@@ -89,7 +97,109 @@ bool Event::WaitUntilSignaled(unsigned timeoutMilliseconds)
     return WaitForSingleObject(m_handle, timeoutMilliseconds) == WAIT_OBJECT_0;
 }
 
-#else // !_WIN32
+#elif defined(WXSPARKLE_PTHREADS)
+
+namespace
+{
+
+// Thread stack size. Thread Manager's default is small and TLS (OpenSSL) and
+// XML parsing in the worker threads need more than that.
+// (used by Thread::Start())
+const size_t THREAD_STACK_SIZE = 256 * 1024;
+
+void ThrowPosixError(const char *what, int err)
+{
+    throw std::runtime_error(std::string(what) + ": " + strerror(err));
+}
+
+} // anonymous namespace
+
+Event::Event(bool manualReset)
+    : m_signaled(false), m_manualReset(manualReset)
+{
+    int err = pthread_mutex_init(&m_mutex, NULL);
+    if ( err )
+        ThrowPosixError("Failed to create mutex", err);
+
+    pthread_condattr_t attr;
+    pthread_condattr_init(&attr);
+    // timeouts must not be affected by changes to the clock
+    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    err = pthread_cond_init(&m_cond, &attr);
+    pthread_condattr_destroy(&attr);
+    if ( err )
+    {
+        pthread_mutex_destroy(&m_mutex);
+        ThrowPosixError("Failed to create condition variable", err);
+    }
+}
+
+Event::~Event()
+{
+    pthread_cond_destroy(&m_cond);
+    pthread_mutex_destroy(&m_mutex);
+}
+
+void Event::Signal()
+{
+    pthread_mutex_lock(&m_mutex);
+    m_signaled = true;
+    if ( m_manualReset )
+        pthread_cond_broadcast(&m_cond);
+    else
+        pthread_cond_signal(&m_cond);
+    pthread_mutex_unlock(&m_mutex);
+}
+
+bool Event::WaitUntilSignaled(unsigned timeoutMilliseconds)
+{
+    timespec deadline = {};
+    if ( timeoutMilliseconds != INFINITE_WAIT )
+    {
+        clock_gettime(CLOCK_MONOTONIC, &deadline);
+        deadline.tv_sec += timeoutMilliseconds / 1000;
+        deadline.tv_nsec += long(timeoutMilliseconds % 1000) * 1000000L;
+        if ( deadline.tv_nsec >= 1000000000L )
+        {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000L;
+        }
+    }
+
+    pthread_mutex_lock(&m_mutex);
+    while ( !m_signaled )
+    {
+        if ( timeoutMilliseconds == INFINITE_WAIT )
+        {
+            pthread_cond_wait(&m_cond, &m_mutex);
+        }
+        else if ( pthread_cond_timedwait(&m_cond, &m_mutex, &deadline) == ETIMEDOUT )
+        {
+            break;
+        }
+    }
+
+    const bool signaled = m_signaled;
+    if ( signaled && !m_manualReset )
+        m_signaled = false;
+    pthread_mutex_unlock(&m_mutex);
+
+    return signaled;
+}
+
+
+CriticalSection::CriticalSection()
+{
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    const int err = pthread_mutex_init(&m_cs, &attr);
+    pthread_mutexattr_destroy(&attr);
+    if ( err )
+        ThrowPosixError("Failed to create mutex", err);
+}
+
+#else // !_WIN32 && !WXSPARKLE_PTHREADS
 
 Event::Event(bool manualReset)
     : m_signaled(false), m_manualReset(manualReset)
@@ -131,7 +241,7 @@ bool Event::WaitUntilSignaled(unsigned timeoutMilliseconds)
     return true;
 }
 
-#endif // _WIN32/!_WIN32
+#endif // _WIN32/WXSPARKLE_PTHREADS/other
 
 
 /*--------------------------------------------------------------------------*
@@ -145,6 +255,8 @@ Thread::Thread(const char *name)
       m_terminateEvent(true)
 #ifdef _WIN32
       , m_handle(NULL), m_id(0)
+#elif defined(WXSPARKLE_PTHREADS)
+      , m_thread(NULL)
 #endif
 {
 }
@@ -163,6 +275,18 @@ Thread::~Thread()
             WaitForSingleObject(m_handle, INFINITE);
         }
         CloseHandle(m_handle);
+    }
+#elif defined(WXSPARKLE_PTHREADS)
+    if ( m_thread )
+    {
+        // (a thread can't wait for itself: the wxThread object is leaked
+        // then, but this doesn't happen in practice)
+        if ( !IsCurrentThread() )
+        {
+            RequestTermination();
+            m_thread->Wait();
+            delete m_thread;
+        }
     }
 #else
     if ( m_thread.joinable() )
@@ -183,6 +307,8 @@ bool Thread::IsCurrentThread() const
 {
 #ifdef _WIN32
     return m_id != 0 && m_id == GetCurrentThreadId();
+#elif defined(WXSPARKLE_PTHREADS)
+    return m_thread && wxThread::This() == m_thread;
 #else
     return m_thread.get_id() == std::this_thread::get_id();
 #endif
@@ -218,6 +344,34 @@ bool Thread::IsCurrentThread() const
     ThreadEntryPoint(reinterpret_cast<Thread*>(data));
     return 0;
 }
+#elif defined(WXSPARKLE_PTHREADS)
+/*static*/ void *Thread::PosixThreadEntryPoint(void *data)
+{
+    ThreadEntryPoint(reinterpret_cast<Thread*>(data));
+    return NULL;
+}
+
+// On classic Mac OS, threads are cooperative and wxWidgets' event loop only
+// lets other threads run (instead of sleeping in WaitNextEvent()) if it knows
+// about them, i.e. if they are wxThreads: so the threads are wxThreads there.
+class ThreadRunner : public wxThread
+{
+public:
+    ThreadRunner(Thread *thread, wxThreadKind kind)
+        : wxThread(kind), m_owner(thread)
+    {
+    }
+
+protected:
+    ExitCode Entry() override
+    {
+        Thread::PosixThreadEntryPoint(m_owner);
+        return 0;
+    }
+
+private:
+    Thread *m_owner;
+};
 #endif
 
 
@@ -255,6 +409,27 @@ void Thread::Start()
     // gone already, so only the local copy is used)
     if ( !joinable )
         CloseHandle(handle);
+#elif defined(WXSPARKLE_PTHREADS)
+    ThreadRunner *runner = new ThreadRunner(this, joinable ? wxTHREAD_JOINABLE
+                                                           : wxTHREAD_DETACHED);
+    if ( runner->Create(THREAD_STACK_SIZE) != wxTHREAD_NO_ERROR )
+    {
+        delete runner;
+        throw std::runtime_error("Failed to start thread");
+    }
+
+    // (must be set before the thread runs: a self-destructing thread may
+    // delete 'this' as soon as it does, but those don't store it)
+    if ( joinable )
+        m_thread = runner;
+
+    if ( runner->Run() != wxTHREAD_NO_ERROR )
+    {
+        if ( joinable )
+            m_thread = NULL;
+        delete runner;
+        throw std::runtime_error("Failed to start thread");
+    }
 #else
     // Use a local std::thread object: a self-destructing thread may finish
     // (and delete 'this') before we get to detach it.
@@ -294,6 +469,13 @@ void Thread::Join()
 
     CloseHandle(m_handle);
     m_handle = NULL;
+#elif defined(WXSPARKLE_PTHREADS)
+    if ( m_thread )
+    {
+        m_thread->Wait();
+        delete m_thread;
+        m_thread = NULL;
+    }
 #else
     if ( m_thread.joinable() )
         m_thread.join();
